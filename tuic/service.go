@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -49,14 +50,22 @@ type Service[U comparable] struct {
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
-	userMap           map[[16]byte]U
-	passwordMap       map[U]string
+	users             atomic.Pointer[serviceUsers[U]]
 	congestionControl string
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
 	handler           ServiceHandler
 
 	quicListener io.Closer
+}
+
+// serviceUsers is an immutable snapshot of the authorized user set. Both maps
+// are always replaced together through a single atomic store so an
+// authenticating connection can never observe a UUID from one generation and a
+// password from another.
+type serviceUsers[U comparable] struct {
+	userMap     map[[16]byte]U
+	passwordMap map[U]string
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -87,7 +96,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		tlsConfig:         options.TLSConfig,
 		heartbeat:         options.Heartbeat,
 		quicConfig:        quicConfig,
-		userMap:           make(map[[16]byte]U),
 		congestionControl: options.CongestionControl,
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
@@ -102,8 +110,7 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
 		userMap[uuidList[index]] = userList[index]
 		passwordMap[userList[index]] = passwordList[index]
 	}
-	s.userMap = userMap
-	s.passwordMap = passwordMap
+	s.users.Store(&serviceUsers[U]{userMap: userMap, passwordMap: passwordMap})
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -243,12 +250,16 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
-		user, loaded := s.userMap[userUUID]
+		users := s.users.Load()
+		if users == nil {
+			return E.New("authentication: no user configured")
+		}
+		user, loaded := users.userMap[userUUID]
 		if !loaded {
 			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
 		}
 		handshakeState := s.quicConn.ConnectionState()
-		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
+		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(users.passwordMap[user]), 32)
 		if err != nil {
 			return E.Cause(err, "authentication: export keying material")
 		}
